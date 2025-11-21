@@ -2606,7 +2606,7 @@ def main():
     scrape_parser.add_argument('--smtp-host', default='smtp.gmail.com', help='SMTP server hostname for notifications')
     scrape_parser.add_argument('--smtp-port', type=int, default=587, help='SMTP server port')
     scrape_parser.add_argument('--smtp-username', default='malikameerhamzaqtb@gmail.com', help='SMTP username for notifications')
-    scrape_parser.add_argument('--smtp-password', default='ogzm qkvw ppma mzzy', help='SMTP password or app password')
+    scrape_parser.add_argument('--smtp-password', default='', help='SMTP password or app password')
     scrape_parser.add_argument('--smtp-from', default='malikameerhamzaqtb@gmail.com', help='From address for notification emails')
     scrape_parser.add_argument('--smtp-to', default='i221570@nu.edu.pk', help='Comma-separated recipients for notifications')
     scrape_parser.add_argument('--smtp-no-tls', action='store_true', help='Disable STARTTLS when sending email notifications')
