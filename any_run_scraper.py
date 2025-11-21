@@ -8,6 +8,7 @@ import ssl
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Iterable, List, Optional, Set
@@ -18,6 +19,7 @@ import pyautogui
 import undetected_chromedriver as uc
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
@@ -59,7 +61,8 @@ class AnyRunScraper:
             if self.config.state_path
             else None
         )
-        self._pages_processed: int = 0
+        self._last_processed_date: Optional[str] = None
+        self._current_scraping_date: Optional[datetime] = None
         self._bot_notified: bool = False
         self._load_state()
 
@@ -101,16 +104,27 @@ class AnyRunScraper:
             self._collected_urls.update(
                 str(url) for url in urls if isinstance(url, str)
             )
+        
+        last_date = data.get("last_processed_date")
+        if isinstance(last_date, str) and last_date:
+            self._last_processed_date = last_date
+            # Parse the date to resume from
+            try:
+                self._current_scraping_date = datetime.strptime(last_date, "%d %B %Y, %H:%M").replace(hour=0, minute=0, second=0, microsecond=0)
+            except:
+                try:
+                    self._current_scraping_date = datetime.strptime(last_date.split(',')[0], "%d %B %Y")
+                except:
+                    pass
 
-        pages_processed = data.get("pages_processed", 0)
-        if isinstance(pages_processed, int) and pages_processed >= 0:
-            self._pages_processed = pages_processed
-
-        if self._collected_urls or self._pages_processed:
+        if self._collected_urls:
             print(
-                f"Resuming with {len(self._collected_urls)} URLs collected across "
-                f"{self._pages_processed} processed page(s)."
+                f"Resuming with {len(self._collected_urls)} URLs collected."
             )
+            if self._last_processed_date:
+                print(f"Last processed date: {self._last_processed_date}")
+            if self._current_scraping_date:
+                print(f"Resuming from date: {self._current_scraping_date.strftime('%m/%d/%Y')}")
 
     def _save_state(self) -> None:
         if self._state_path is None:
@@ -118,7 +132,8 @@ class AnyRunScraper:
 
         state_data = {
             "collected_urls": sorted(self._collected_urls),
-            "pages_processed": self._pages_processed,
+            "last_processed_date": self._last_processed_date,
+            "current_scraping_date": self._current_scraping_date.strftime("%m/%d/%Y") if self._current_scraping_date else None,
             "timestamp": time.time(),
         }
 
@@ -154,76 +169,6 @@ class AnyRunScraper:
             print(f"{reason} Sleeping for {delay:.2f} second(s) to respect limits.")
             time.sleep(delay)
 
-    def _skip_processed_pages(self) -> bool:
-        pages_to_skip = self._pages_processed
-        if pages_to_skip <= 0:
-            return True
-
-        target_page = pages_to_skip + 1
-
-        current_page = self._get_current_page_number()
-        if current_page is not None:
-            if current_page >= target_page:
-                if current_page > target_page:
-                    print(
-                        "Warning: Pagination page exceeds expected target. Proceeding with scraping regardless."
-                    )
-                else:
-                    print(
-                        f"Current page {current_page} already matches the expected resume page {target_page}."
-                    )
-                return True
-            pages_to_skip = max(target_page - current_page, 0)
-            if pages_to_skip == 0:
-                return True
-            print(
-                f"Resuming from stored progress: currently on page {current_page}, advancing {pages_to_skip} page(s) to reach page {target_page}."
-            )
-        else:
-            print(
-                f"Attempting to resume at page {target_page} (skipping {pages_to_skip} previously processed page(s))."
-            )
-
-        attempts = 0
-        max_attempts = max(pages_to_skip + 3, 5)
-
-        while attempts < max_attempts:
-            while self._handle_bot_challenge():
-                pass
-
-            page_from_ui = self._get_current_page_number()
-            if page_from_ui is not None:
-                print(
-                    f"Pagination element reports current page {page_from_ui} while seeking page {target_page}."
-                )
-                if page_from_ui >= target_page:
-                    if page_from_ui > target_page:
-                        print(
-                            "Warning: Pagination page exceeds expected target. Proceeding with scraping regardless."
-                        )
-                    return True
-            else:
-                print(
-                    "Pagination element did not provide a page number; continuing using saved state increments."
-                )
-
-            print(
-                f"Advancing to next page to align with saved state (attempt {attempts + 1} of {max_attempts})."
-            )
-            if not self._go_to_next_page():
-                print(
-                    "Reached the end while skipping processed pages. No new pages to scrape."
-                )
-                return False
-
-            attempts += 1
-            self._apply_page_delay("Skipped page")
-
-        print(
-            "Unable to reconcile pagination state with saved progress after multiple attempts."
-        )
-        return False
-
     @property
     def driver(self) -> WebDriver:
         if self._driver is None:
@@ -247,35 +192,107 @@ class AnyRunScraper:
         self.driver.get(self.config.base_url)
         self._ensure_authenticated()
         self._ensure_table_loaded()
-
-        if not self._skip_processed_pages():
-            urls = sorted(self._collected_urls)
-            self._save_results(urls, final=True)
-            self._clear_state()
-            return urls
-
+        
+        # Start from current scraping date or today
+        if self._current_scraping_date:
+            current_date = self._current_scraping_date
+            print(f"Resuming from: {current_date.strftime('%m/%d/%Y')}")
+        else:
+            current_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            print(f"Starting from today: {current_date.strftime('%m/%d/%Y')}")
+        
+        # Scrape day by day, going backwards
         while True:
-            while self._handle_bot_challenge():
-                pass
-            current_page = self._pages_processed + 1
-            print(f"Processing page {current_page}...")
-            self._collect_current_page_urls()
-            self._pages_processed += 1
-            self._persist_progress()
-            self._apply_page_delay("Finished page")
-            page_from_ui = self._get_current_page_number()
-            if page_from_ui is not None:
-                print(
-                    f"Pagination element reports current page {page_from_ui} before advancing."
-                )
-            if not self._go_to_next_page():
-                print("No further pages detected. Wrapping up scraping run.")
+            self._current_scraping_date = current_date
+            date_str = current_date.strftime("%m/%d/%Y")
+            
+            print(f"\n{'='*60}")
+            print(f"Scraping date: {date_str}")
+            print(f"{'='*60}")
+            
+            # Apply date filter for this specific day
+            if not self._apply_date_filter_for_day(date_str):
+                print(f"Failed to apply date filter for {date_str}. Stopping.")
                 break
-
+            
+            # Collect all URLs from this day (across all pages)
+            page_count = 0
+            while True:
+                while self._handle_bot_challenge():
+                    pass
+                    
+                page_count += 1
+                print(f"  Processing page {page_count} for {date_str}...")
+                
+                urls_before = len(self._collected_urls)
+                self._collect_current_page_urls()
+                urls_collected = len(self._collected_urls) - urls_before
+                print(f"    Collected {urls_collected} URLs from this page")
+                
+                self._persist_progress()
+                self._apply_page_delay("Finished page")
+                
+                if not self._go_to_next_page():
+                    print(f"  No more pages for {date_str}")
+                    break
+            
+            print(f"Completed {date_str}. Total URLs collected: {len(self._collected_urls)}")
+            
+            # Move to previous day
+            current_date = current_date - timedelta(days=1)
+            print(f"\nMoving to previous day: {current_date.strftime('%m/%d/%Y')}")
+        
         urls = sorted(self._collected_urls)
         self._save_results(urls, final=True)
         self._clear_state()
         return urls
+    
+    def _apply_date_filter_for_day(self, date_str: str) -> bool:
+        """Apply date filter for a specific day (same date in both from and to fields)."""
+        try:
+            # Click filter button
+            print(f"  Clicking filter button...")
+            filter_button = self.wait.until(
+                EC.element_to_be_clickable((By.ID, "history-filterBtn"))
+            )
+            filter_button.click()
+            time.sleep(2)
+            
+            # Find the "From" date input field
+            print(f"  Setting 'From' date to: {date_str}")
+            date_from_input = self.wait.until(
+                EC.presence_of_element_located((By.ID, "dateFrom"))
+            )
+            date_from_input.clear()
+            date_from_input.send_keys(date_str)
+            time.sleep(0.5)
+            
+            # Find the "To" date input field
+            print(f"  Setting 'To' date to: {date_str}")
+            date_to_input = self.wait.until(
+                EC.presence_of_element_located((By.ID, "dateTo"))
+            )
+            date_to_input.clear()
+            date_to_input.send_keys(date_str)
+            time.sleep(1)
+            
+            # Click the Search button
+            print(f"  Clicking Search button...")
+            search_button = self.wait.until(
+                EC.element_to_be_clickable((By.ID, "historySearchBtn"))
+            )
+            search_button.click()
+            
+            # Wait for table to reload
+            time.sleep(3)
+            self._ensure_table_loaded()
+            
+            print(f"  ✓ Date filter applied: {date_str}")
+            return True
+            
+        except (NoSuchElementException, TimeoutException) as e:
+            print(f"  ✗ Failed to apply date filter: {e}")
+            return False
 
     def _ensure_table_loaded(self) -> None:
         while True:
@@ -297,6 +314,16 @@ class AnyRunScraper:
     def _collect_current_page_urls(self) -> None:
         rows = self.driver.find_elements(By.CSS_SELECTOR, ".history-table--content__row")
         for row in rows:
+            # Extract date from the row for verification and storage
+            try:
+                date_elem = row.find_element(By.CSS_SELECTOR, ".os__time")
+                row_date = date_elem.text.strip()
+                if row_date:
+                    # Store the most recent date we've seen
+                    self._last_processed_date = row_date
+            except NoSuchElementException:
+                pass
+            
             for link in self._extract_links(row):
                 href = link.get_attribute("href")
                 if href and "/tasks" in href and "/browse" not in href:
@@ -307,24 +334,6 @@ class AnyRunScraper:
             return row.find_elements(By.TAG_NAME, "a")
         except StaleElementReferenceException:
             return []
-
-    def _get_current_page_number(self) -> Optional[int]:
-        """Return the current page number as reported by the pagination control."""
-        xpath = "//span[@class='history-pagination__hidden-span']"
-        try:
-            candidates = self.driver.find_elements(By.XPATH, xpath)
-        except Exception:
-            return None
-
-        for candidate in candidates:
-            text = (candidate.text or "").strip()
-            if not text:
-                continue
-            try:
-                return int(text)
-            except ValueError:
-                continue
-        return None
 
     def _go_to_next_page(self) -> bool:
         while self._handle_bot_challenge():
