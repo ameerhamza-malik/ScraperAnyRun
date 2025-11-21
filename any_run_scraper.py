@@ -203,44 +203,75 @@ class AnyRunScraper:
         
         # Scrape day by day, going backwards
         while True:
-            self._current_scraping_date = current_date
-            date_str = current_date.strftime("%m/%d/%Y")
-            
-            print(f"\n{'='*60}")
-            print(f"Scraping date: {date_str}")
-            print(f"{'='*60}")
-            
-            # Apply date filter for this specific day
-            if not self._apply_date_filter_for_day(date_str):
-                print(f"Failed to apply date filter for {date_str}. Stopping.")
-                break
-            
-            # Collect all URLs from this day (across all pages)
-            page_count = 0
-            while True:
-                while self._handle_bot_challenge():
-                    pass
+            try:
+                self._current_scraping_date = current_date
+                date_str = current_date.strftime("%m/%d/%Y")
+                
+                print(f"\n{'='*60}")
+                print(f"Scraping date: {date_str}")
+                print(f"{'='*60}")
+                
+                # Apply date filter for this specific day
+                if not self._apply_date_filter_for_day(date_str):
+                    print(f"Failed to apply date filter for {date_str}.")
+                    print(f"Waiting 10 seconds before moving to previous date...")
+                    time.sleep(10)
+                    # Move to previous day and continue
+                    current_date = current_date - timedelta(days=1)
+                    print(f"Moving to previous day: {current_date.strftime('%m/%d/%Y')}")
+                    continue
+                
+                # Collect all URLs from this day (across all pages)
+                page_count = 0
+                while True:
+                    try:
+                        while self._handle_bot_challenge():
+                            pass
+                            
+                        page_count += 1
+                        print(f"  Processing page {page_count} for {date_str}...")
+                        
+                        urls_before = len(self._collected_urls)
+                        self._collect_current_page_urls()
+                        urls_collected = len(self._collected_urls) - urls_before
+                        print(f"    Collected {urls_collected} URLs from this page")
+                        
+                        self._persist_progress()
+                        self._apply_page_delay("Finished page")
+                        
+                        if not self._go_to_next_page():
+                            print(f"  No more pages for {date_str}")
+                            break
                     
-                page_count += 1
-                print(f"  Processing page {page_count} for {date_str}...")
+                    except Exception as page_error:
+                        print(f"  ⚠ Error processing page {page_count}: {page_error}")
+                        print(f"  Waiting 5 seconds before moving to next page...")
+                        time.sleep(5)
+                        # Try to continue with next page
+                        if not self._go_to_next_page():
+                            print(f"  Cannot continue, moving to previous date")
+                            break
+                        continue
                 
-                urls_before = len(self._collected_urls)
-                self._collect_current_page_urls()
-                urls_collected = len(self._collected_urls) - urls_before
-                print(f"    Collected {urls_collected} URLs from this page")
+                print(f"Completed {date_str}. Total URLs collected: {len(self._collected_urls)}")
                 
-                self._persist_progress()
-                self._apply_page_delay("Finished page")
-                
-                if not self._go_to_next_page():
-                    print(f"  No more pages for {date_str}")
-                    break
+                # Move to previous day
+                current_date = current_date - timedelta(days=1)
+                print(f"\nMoving to previous day: {current_date.strftime('%m/%d/%Y')}")
             
-            print(f"Completed {date_str}. Total URLs collected: {len(self._collected_urls)}")
-            
-            # Move to previous day
-            current_date = current_date - timedelta(days=1)
-            print(f"\nMoving to previous day: {current_date.strftime('%m/%d/%Y')}")
+            except Exception as date_error:
+                print(f"\n⚠ Error processing date {date_str}: {date_error}")
+                print(f"Waiting 10 seconds before moving to previous date...")
+                time.sleep(10)
+                # Save current progress
+                try:
+                    self._persist_progress()
+                except:
+                    pass
+                # Move to previous day and continue
+                current_date = current_date - timedelta(days=1)
+                print(f"Recovering... Moving to previous day: {current_date.strftime('%m/%d/%Y')}")
+                continue
         
         urls = sorted(self._collected_urls)
         self._save_results(urls, final=True)
