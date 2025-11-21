@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from collections import Counter
 import pyautogui
+import boto3
+from botocore.exceptions import ClientError
 
 import pandas as pd
 import undetected_chromedriver as uc
@@ -59,6 +61,8 @@ class ReportScraper:
         smtp_from: Optional[str] = None,
         smtp_to: Optional[str] = None,
         smtp_use_tls: bool = True,
+        s3_bucket: Optional[str] = None,
+        use_s3: bool = False,
     ):
         self.input_excel = input_excel
         self.output_dir = Path(output_dir)
@@ -77,9 +81,22 @@ class ReportScraper:
         self.smtp_from = smtp_from
         self.smtp_to = smtp_to
         self.smtp_use_tls = smtp_use_tls
+        self.s3_bucket = s3_bucket
+        self.use_s3 = use_s3
         self.base_url = "https://app.any.run/"
         self._last_bot_prompt: float = 0.0
         self._bot_notification_sent = False
+
+        # Initialize S3 client if using S3
+        if self.use_s3:
+            try:
+                self.s3_client = boto3.client('s3')
+                print(f"✓ S3 client initialized for bucket: {self.s3_bucket}")
+            except Exception as e:
+                print(f"⚠ Error initializing S3 client: {e}")
+                self.s3_client = None
+        else:
+            self.s3_client = None
 
         # Create output directories
         self.output_dir.mkdir(exist_ok=True)
@@ -92,6 +109,26 @@ class ReportScraper:
         self.driver = None
         self.wait = None
 
+    def _upload_to_s3(self, local_path: Path, s3_key: str) -> bool:
+        """Upload a file to S3 bucket."""
+        if not self.use_s3 or not self.s3_client:
+            return False
+        
+        try:
+            self.s3_client.upload_file(
+                str(local_path),
+                self.s3_bucket,
+                s3_key
+            )
+            print(f"    ✓ Uploaded to S3: s3://{self.s3_bucket}/{s3_key}")
+            return True
+        except ClientError as e:
+            print(f"    ✗ S3 upload failed: {e}")
+            return False
+        except Exception as e:
+            print(f"    ✗ Error uploading to S3: {e}")
+            return False
+    
     def _load_checkpoint(self) -> Set[str]:
         """Load processed URLs from checkpoint file."""
         if self.checkpoint_file.exists():
@@ -2206,6 +2243,9 @@ class ReportScraper:
         try:
             print(f"  Attempting to download PCAP...")
             
+            # Get list of files before download
+            existing_files = set(self.pcap_dir.glob("*.pcap"))
+            
             # Click the PCAP download buttons
             if not self.find_and_click_pcap_download():
                 print(f"  ✗ Could not download PCAP for task {task_id}")
@@ -2220,9 +2260,52 @@ class ReportScraper:
             pcap_filename = f"{task_id}_{verdict}_{safe_file_name}_{md5}.pcap"
             pcap_path = self.pcap_dir / pcap_filename
             
-            print(f"  ✓ PCAP download initiated for task {task_id}")
-            time.sleep(5)  # Wait for download to complete
-            self._check_for_bot_challenge()
+            print(f"  Waiting for PCAP download to complete...")
+            max_wait = 30  # Maximum wait time in seconds
+            check_interval = 1  # Check every second
+            elapsed = 0
+            
+            downloaded_file = None
+            while elapsed < max_wait:
+                time.sleep(check_interval)
+                elapsed += check_interval
+                self._check_for_bot_challenge()
+                
+                # Check for new .pcap files
+                current_files = set(self.pcap_dir.glob("*.pcap"))
+                new_files = current_files - existing_files
+                
+                # Filter out .crdownload (Chrome partial download) files
+                complete_files = [f for f in new_files if not str(f).endswith('.crdownload')]
+                
+                if complete_files:
+                    downloaded_file = complete_files[0]
+                    print(f"  ✓ PCAP file downloaded: {downloaded_file.name}")
+                    break
+            
+            if not downloaded_file or not downloaded_file.exists():
+                print(f"  ✗ PCAP download timeout or failed for task {task_id}")
+                return None
+            
+            # Rename the downloaded file to our naming convention
+            try:
+                if downloaded_file != pcap_path:
+                    downloaded_file.rename(pcap_path)
+                    print(f"  ✓ Renamed PCAP to: {pcap_filename}")
+            except Exception as e:
+                print(f"  ⚠ Could not rename PCAP file: {e}")
+                pcap_path = downloaded_file
+            
+            # Upload to S3 if enabled
+            if self.use_s3 and pcap_path.exists():
+                s3_key = f"pcaps/{pcap_path.name}"
+                if self._upload_to_s3(pcap_path, s3_key):
+                    # Delete local file after successful upload
+                    try:
+                        pcap_path.unlink()
+                        print(f"    ✓ Deleted local PCAP file: {pcap_path.name}")
+                    except Exception as e:
+                        print(f"    ⚠ Could not delete local PCAP: {e}")
             
             return str(pcap_path)
                 
@@ -2275,6 +2358,17 @@ class ReportScraper:
             report_file = self.output_dir / f"{task_id}_report.json"
             with open(report_file, "w", encoding="utf-8") as f:
                 json.dump(report_data, f, indent=2, ensure_ascii=False)
+            
+            # Upload to S3 if enabled
+            if self.use_s3:
+                s3_key = f"reports/{task_id}_report.json"
+                if self._upload_to_s3(report_file, s3_key):
+                    # Delete local file after successful upload
+                    try:
+                        report_file.unlink()
+                        print(f"    ✓ Deleted local report file: {report_file.name}")
+                    except Exception as e:
+                        print(f"    ⚠ Could not delete local report: {e}")
             
             print(f"  ✓ Scraped task {task_id}")
             return report_data
@@ -2391,6 +2485,17 @@ class ReportScraper:
             df.to_csv(csv_path, index=False)
             print(f"Summary dataset saved to: {csv_path}")
             print(f"Total records: {len(dataset)}")
+            
+            # Upload summary to S3 if enabled
+            if self.use_s3:
+                s3_key = "dataset_summary.csv"
+                if self._upload_to_s3(csv_path, s3_key):
+                    # Delete local file after successful upload
+                    try:
+                        csv_path.unlink()
+                        print(f"    ✓ Deleted local summary file: {csv_path.name}")
+                    except Exception as e:
+                        print(f"    ⚠ Could not delete local summary: {e}")
         else:
             print("No data to save!")
 
@@ -2606,10 +2711,12 @@ def main():
     scrape_parser.add_argument('--smtp-host', default='smtp.gmail.com', help='SMTP server hostname for notifications')
     scrape_parser.add_argument('--smtp-port', type=int, default=587, help='SMTP server port')
     scrape_parser.add_argument('--smtp-username', default='malikameerhamzaqtb@gmail.com', help='SMTP username for notifications')
-    scrape_parser.add_argument('--smtp-password', default='ogzm qkvw ppma mzzy', help='SMTP password or app password')
+    scrape_parser.add_argument('--smtp-password', default='', help='SMTP password or app password')
     scrape_parser.add_argument('--smtp-from', default='malikameerhamzaqtb@gmail.com', help='From address for notification emails')
     scrape_parser.add_argument('--smtp-to', default='i221570@nu.edu.pk', help='Comma-separated recipients for notifications')
     scrape_parser.add_argument('--smtp-no-tls', action='store_true', help='Disable STARTTLS when sending email notifications')
+    scrape_parser.add_argument('--s3-bucket', default='1anyrun.data2', help='S3 bucket name for storing data')
+    scrape_parser.add_argument('--use-s3', action='store_true', default=True, help='Upload data to S3 bucket (default: enabled)')
     
     # Analyze command
     analyze_parser = subparsers.add_parser('analyze', help='Analyze scraped data')
@@ -2643,6 +2750,8 @@ def main():
         args.delay = 2.0
         args.email = "i221570@nu.edu.pk"
         args.password = "Ameerhamza@4"
+        args.s3_bucket = '1anyrun.data2'
+        args.use_s3 = True
     args.smtp_host = 'smtp.gmail.com'
     args.smtp_port = 587
     args.smtp_username = 'malikameerhamzaqtb@gmail.com'
@@ -2670,6 +2779,8 @@ def main():
             smtp_from=args.smtp_from,
             smtp_to=args.smtp_to,
             smtp_use_tls=not args.smtp_no_tls,
+            s3_bucket=args.s3_bucket,
+            use_s3=args.use_s3,
         )
         scraper.run()
         scraper.create_summary_dataset()

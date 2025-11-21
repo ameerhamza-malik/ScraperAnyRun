@@ -696,7 +696,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--smtp-password",
         type=str,
-        default="ogzm qkvw ppma mzzy",
+        default="",
         help="SMTP password if authentication is required",
     )
     parser.add_argument(
